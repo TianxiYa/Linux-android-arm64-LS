@@ -1,0 +1,103 @@
+name: Build lsdriver
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - android: android16-6.12
+            clang: clang-r536225
+          - android: android15-6.6
+            clang: clang-r510928
+          - android: android14-6.1
+            clang: clang-r487747c
+          - android: android14-5.15
+            clang: clang-r487747c
+          - android: android13-5.15
+            clang: clang-r450784e
+          - android: android13-5.10
+            clang: clang-r450784e
+          - android: android12-5.10
+            clang: clang-r416183b
+
+    container:
+      image: ghcr.io/ylarod/ddk:${{ matrix.android }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Remove Module.symvers to skip CRC check
+        run: |
+          KDIR=/opt/ddk/kdir/${{ matrix.android }}
+          if [ -f "$KDIR/Module.symvers" ]; then
+            mv "$KDIR/Module.symvers" "$KDIR/Module.symvers.bak"
+            echo "Removed Module.symvers for no-CRC build"
+          fi
+
+      - name: Build kernel module
+        run: |
+          export PATH=/opt/ddk/clang/${{ matrix.clang }}/bin:$PATH
+          export KDIR=/opt/ddk/kdir/${{ matrix.android }}
+          export DRIVER_SRC=$GITHUB_WORKSPACE/lsdriver
+
+          # First attempt
+          set +e
+          make -C $KDIR \
+            M=$DRIVER_SRC \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            KBUILD_MODPOST_WARN=1 \
+            CONFIG_DEBUG_INFO_BTF=n \
+            CONFIG_EXTENDED_MODVERSIONS=n \
+            modules -j$(nproc)
+          MAKE_STATUS=$?
+
+          # Fix empty __version_ext_names for Android 16 / 6.12
+          MOD_C="$DRIVER_SRC/lsdriver.mod.c"
+          if [ $MAKE_STATUS -ne 0 ] && [ -f "$MOD_C" ]; then
+            if grep -q '__section("__version_ext_names")' "$MOD_C" && \
+               grep -q '^[[:space:]]*;[[:space:]]*$' "$MOD_C"; then
+              echo "Fixing empty __version_ext_names in lsdriver.mod.c..."
+              perl -0pi -e 's/(__used __section\("__version_ext_names"\) =\n);/$1"";/' "$MOD_C"
+              # Retry final link
+              make -C $KDIR \
+                M=$DRIVER_SRC \
+                ARCH=arm64 \
+                LLVM=1 \
+                LLVM_IAS=1 \
+                CROSS_COMPILE=aarch64-linux-gnu- \
+                KBUILD_MODPOST_WARN=1 \
+                CONFIG_DEBUG_INFO_BTF=n \
+                CONFIG_EXTENDED_MODVERSIONS=n \
+                modules -j$(nproc)
+              MAKE_STATUS=$?
+            fi
+          fi
+          set -e
+          exit $MAKE_STATUS
+
+      - name: Restore Module.symvers
+        if: always()
+        run: |
+          KDIR=/opt/ddk/kdir/${{ matrix.android }}
+          if [ -f "$KDIR/Module.symvers.bak" ]; then
+            mv "$KDIR/Module.symvers.bak" "$KDIR/Module.symvers"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lsdriver-${{ matrix.android }}
+          path: lsdriver/lsdriver.ko
