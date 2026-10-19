@@ -156,7 +156,7 @@ build_kernel() {
     case "$version" in
         android17-6.18|android16-6.12|android15-6.6)
             make_args+=(CLANG_TRIPLE=aarch64-linux-gnu-) ;;
-        android14-6.1|android13-5.15|android13-5.10)
+        android14-6.1|android14-5.15|android13-5.15|android13-5.10)
             make_args+=("LLVM_TOOLCHAIN_PATH=${clang_path%/bin}") ;;
         android12-5.10)
             make_args+=(HOSTCC=clang HOSTCXX=clang++ HOSTLD=ld.lld) ;;
@@ -189,13 +189,13 @@ main() {
     local targets=("$@")
     local version clang_version input
     if [[ ${#targets[@]} -eq 0 ]]; then
-        targets=(android17-6.18 android16-6.12 android15-6.6 android14-6.1 android13-5.15 android13-5.10 android12-5.10)
+        targets=(android17-6.18 android16-6.12 android15-6.6 android14-6.1 android14-5.15 android13-5.15 android13-5.10 android12-5.10)
     fi
 
     # 在清理文件或修改内核配置之前检查所有输入。
     for version in "${targets[@]}"; do
         case "$version" in
-            android17-6.18|android16-6.12|android15-6.6|android14-6.1|android13-5.15|android13-5.10|android12-5.10) ;;
+            android17-6.18|android16-6.12|android15-6.6|android14-6.1|android14-5.15|android13-5.15|android13-5.10|android12-5.10) ;;
             *) log_error "不支持的 DDK 构建目标: $version"; return 2 ;;
         esac
     done
@@ -231,7 +231,7 @@ main() {
             android17-6.18) clang_version=clang-r584948c ;;
             android16-6.12) clang_version=clang-r536225 ;;
             android15-6.6) clang_version=clang-r510928 ;;
-            android14-6.1) clang_version=clang-r487747c ;;
+            android14-6.1|android14-5.15) clang_version=clang-r487747c ;;
             android13-5.15|android13-5.10) clang_version=clang-r450784e ;;
             android12-5.10) clang_version=clang-r416183b ;;
         esac
