@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       strip_debug:
-        description: Strip debug symbols (Android 15/16 always keep symbols)
+        description: Strip debug symbols (Android 15/16/17 always keep symbols)
         type: boolean
         default: false
   push:
@@ -16,13 +16,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        android:
-          - android16-6.12
-          - android15-6.6
-          - android14-6.1
-          - android13-5.15
-          - android13-5.10
-          - android12-5.10
+        include:
+          - android: android17-6.18
+            module: 6.18-Android17
+          - android: android16-6.12
+            module: 6.12-Android16
+          - android: android15-6.6
+            module: 6.6-Android15
+          - android: android14-6.1
+            module: 6.1-Android14
+          - android: android13-5.15
+            module: 5.15-Android13
+          - android: android13-5.10
+            module: 5.10-Android13
+          - android: android12-5.10
+            module: 5.10-Android12
 
     container:
       image: ghcr.io/ylarod/ddk:${{ matrix.android }}
@@ -44,5 +52,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: lsdriver-${{ matrix.android }}
-          path: lsdriver/${{ matrix.android }}lsdriver.ko
+          path: lsdriver/byte_stream/${{ matrix.module }}.ko
           if-no-files-found: error

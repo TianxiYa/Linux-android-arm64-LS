@@ -11,7 +11,9 @@ BUILD_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CLANG_ROOT="${CLANG_ROOT:-/opt/ddk/clang}"
 KERNELS_ROOT="${KERNELS_ROOT:-/opt/ddk/kdir}"
 DRIVER_SRC="${DRIVER_SRC:-$BUILD_ROOT/lsdriver}"
-NO_STRIP_VERSIONS=("android16-6.12" "android15-6.6")
+VERSION_HEADER="$DRIVER_SRC/io_version/version.h"
+NO_STRIP_VERSIONS=("android17-6.18" "android16-6.12" "android15-6.6")
+source "$BUILD_ROOT/scripts/kernel_build_common.sh"
 
 # -------------------------- 颜色定义 --------------------------
 GREEN='\e[32m'
@@ -23,6 +25,8 @@ NC='\e[0m'
 # -------------------------- 全局变量 --------------------------
 declare -a BUILD_RESULTS=()
 STRIP_CHOICE="${STRIP_CHOICE:-}"
+SYMVERS_FILE=""
+SYMVERS_BACKUP=""
 
 # -------------------------- 日志函数 --------------------------
 log_info()  { echo -e "${GREEN}$*${NC}"; }
@@ -57,15 +61,27 @@ cleanup_driver_build_on_exit() {
     local status=$?
 
     trap - EXIT
+    restore_symvers || status=1
     clean_driver_build || true
     exit "$status"
+}
+
+# 保证正常退出、编译失败和最终链接重试失败时均恢复 DDK 的符号表。
+restore_symvers() {
+    if [[ -n "$SYMVERS_BACKUP" ]]; then
+        mv -- "$SYMVERS_BACKUP" "$SYMVERS_FILE" || return $?
+        SYMVERS_BACKUP=""
+    fi
 }
 
 # -------------------------- 处理编译产物 --------------------------
 handle_output() {
     local version="$1"
     local source_ko="$DRIVER_SRC/lsdriver.ko"
-    local target_ko="$DRIVER_SRC/${version}lsdriver.ko"
+    local module_name="${version#*-}-Android${version%%-*}"
+    module_name="${module_name/Androidandroid/Android}"
+    local target_ko="$DRIVER_SRC/byte_stream/${module_name}.ko"
+    mkdir -p "$DRIVER_SRC/byte_stream" || return $?
     if [[ ! -f "$source_ko" ]]; then
         log_error "❌ $version 编译失败（未生成 .ko 文件）"
         BUILD_RESULTS+=("$version: ❌ 编译失败")
@@ -114,22 +130,52 @@ build_kernel() {
 
     clean_driver_build
 
-    # 临时禁用 BTF
-    if [[ -f "$kernel_dir/.config" ]]; then
-        sed -i 's/CONFIG_DEBUG_INFO_BTF=y/CONFIG_DEBUG_INFO_BTF=n/g' "$kernel_dir/.config"
+    # 与 build_all.sh 一致：保留 modversions vermagic，但不导入具体符号 CRC。
+    # 仅通过 make 参数关闭模块 BTF，不改写 DDK 的 .config。
+    SYMVERS_FILE="$kernel_dir/Module.symvers"
+    if [[ -f "$SYMVERS_FILE" ]]; then
+        local backup_path="$SYMVERS_FILE.no_crc_bak.$$"
+        if [[ -e "$backup_path" ]]; then
+            log_error "符号表备份已存在: $backup_path"
+            return 1
+        fi
+        mv -- "$SYMVERS_FILE" "$backup_path"
+        SYMVERS_BACKUP="$backup_path"
     fi
 
-    log_info "🚀 执行编译命令..."
+    local make_args=(
+        -C "$kernel_dir"
+        M="$DRIVER_SRC"
+        ARCH=arm64
+        CROSS_COMPILE="$cross_compile"
+        LLVM=1 LLVM_IAS=1
+        CONFIG_DEBUG_INFO_BTF_MODULES=
+        KBUILD_MODPOST_WARN=1
+        CONFIG_EXTENDED_MODVERSIONS=n
+    )
+    case "$version" in
+        android17-6.18|android16-6.12|android15-6.6)
+            make_args+=(CLANG_TRIPLE=aarch64-linux-gnu-) ;;
+        android14-6.1|android13-5.15|android13-5.10)
+            make_args+=("LLVM_TOOLCHAIN_PATH=${clang_path%/bin}") ;;
+        android12-5.10)
+            make_args+=(HOSTCC=clang HOSTCXX=clang++ HOSTLD=ld.lld) ;;
+    esac
+    make_args+=(modules -j"$(nproc)")
+
+    log_info "🚀 执行无 CRC 模块编译..."
     export PATH="$clang_path:$PATH"
-    make -C "$kernel_dir" \
-        M="$DRIVER_SRC" \
-        ARCH=arm64 \
-        CROSS_COMPILE="$cross_compile" \
-        LLVM=1 \
-        LLVM_IAS=1 \
-        PATH="$PATH" \
-        CONFIG_DEBUG_INFO_BTF=n \
-        modules -j"$(nproc)"
+    local make_status=0
+    make "${make_args[@]}" || make_status=$?
+    if [[ $make_status -ne 0 ]] && fix_empty_ext_modversions; then
+        log_warn "已修复空 __version_ext_names，重试最终链接"
+        make_status=0
+        make "${make_args[@]}" || make_status=$?
+    fi
+    restore_symvers
+    if [[ $make_status -ne 0 ]]; then
+        return "$make_status"
+    fi
 
     local output_status=0
     handle_output "$version" || output_status=$?
@@ -143,13 +189,13 @@ main() {
     local targets=("$@")
     local version clang_version input
     if [[ ${#targets[@]} -eq 0 ]]; then
-        targets=(android16-6.12 android15-6.6 android14-6.1 android13-5.15 android13-5.10 android12-5.10)
+        targets=(android17-6.18 android16-6.12 android15-6.6 android14-6.1 android13-5.15 android13-5.10 android12-5.10)
     fi
 
     # 在清理文件或修改内核配置之前检查所有输入。
     for version in "${targets[@]}"; do
         case "$version" in
-            android16-6.12|android15-6.6|android14-6.1|android13-5.15|android13-5.10|android12-5.10) ;;
+            android17-6.18|android16-6.12|android15-6.6|android14-6.1|android13-5.15|android13-5.10|android12-5.10) ;;
             *) log_error "不支持的 DDK 构建目标: $version"; return 2 ;;
         esac
     done
@@ -178,8 +224,11 @@ main() {
     fi
 
     trap cleanup_driver_build_on_exit EXIT
+    # 与主脚本相同，每次调用只递增一次；CI 各任务从同一提交获得相同版本。
+    update_driver_version
     for version in "${targets[@]}"; do
         case "$version" in
+            android17-6.18) clang_version=clang-r584948c ;;
             android16-6.12) clang_version=clang-r536225 ;;
             android15-6.6) clang_version=clang-r510928 ;;
             android14-6.1) clang_version=clang-r487747c ;;
@@ -198,7 +247,7 @@ main() {
     echo "----------------------------------------------------"
 
     echo -e "\n${BLUE}📦 生成的产物列表:${NC}"
-    ls -lh "$DRIVER_SRC"/android*.ko 2>/dev/null || log_error "❌ 未找到任何 .ko 产物"
+    ls -lh "$DRIVER_SRC/byte_stream"/*.ko 2>/dev/null || log_error "❌ 未找到任何 .ko 产物"
 
     log_title
     log_info "🎉 批量编译脚本执行完成！"
