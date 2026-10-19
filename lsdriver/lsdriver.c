@@ -1,4 +1,4 @@
-﻿
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
@@ -16,10 +16,11 @@
 #include <linux/kobject.h>
 #include <linux/kallsyms.h>
 
-#include "io_struct.h"
+#include "io_version/io_struct.h"
 #include "export_fun.h"
 #include "inline_hook_frame.h"
-#include "lsdriver_log.h"
+#include "klog/lsdriver_log.h"
+#include "io_version/version.h"
 #include "hide_proc.h"
 #include "hide_task.h"
 #include "hide_kgsl.h"
@@ -57,82 +58,95 @@ static int DispatchThreadFunction(void *data)
     {
         if (ls_process_task)
         {
-            if (req->kernel) // 确实有任务
+            /*
+            不使用__atomic_exchange_n 是性能问题：
+            内核轮询到部分时没任务会反复执行swpa wzr, w8, [addr]交换，开销比只读大几倍
+            有持续任务的话使用__atomic_exchange_n快
+            现在的情况是5000次外的睡眠不管吧，请求低的下70%时间都轮询到睡眠了上了，睡眠没啥好说的
+            在5000次内可能1300次轮询后才有实际请求到，或者3400次才到
+            5000次全空是这情况，有持续任务还是__atomic_exchange_n快
+            设备	exchange：swpa	load：ldar
+            RMX3888	5.70–6.20 ns/轮	0.43–0.46 ns/轮
+            PCAM00	122.90–145.72 ns/轮	1.10 1.15 ns/轮
+            */
+            if (__atomic_load_n(&req->kernel, __ATOMIC_ACQUIRE)) // 确实有任务
             {
                 // 有活干，重置计数器
                 spin_count = 0;
 
-                req->kernel = false; // 清除请求标志
+                __atomic_store_n(&req->kernel, 0, __ATOMIC_RELAXED); // 清除请求标志
 
-                switch (req->op) // 派发
+                enum request_op op = __atomic_load_n(&req->op, __ATOMIC_RELAXED);
+
+                switch (op) // 派发
                 {
                 case request_op_none:
                     break;
                 case request_op_vmem_read:
                 case request_op_vmem_write:
-                    req->status = virtual_memory_rw(req->op, req->tgid, req->vmemrw_info.rw_addr, &req->vmemrw_info.user_buffer, req->vmemrw_info.size);
+                    __atomic_store_n(&req->status, virtual_memory_rw(op, req->tgid, req->vmemrw_info.rw_addr, &req->vmemrw_info.user_buffer, req->vmemrw_info.size), __ATOMIC_RELAXED);
                     break;
                 case request_op_vmem_info:
-                    req->status = virtual_memory_enum(req->tgid, &req->vmem_info);
+                    __atomic_store_n(&req->status, virtual_memory_enum(req->tgid, &req->vmem_info), __ATOMIC_RELAXED);
                     break;
                 case request_op_touch_init:
-                    req->status = v_touch_init(req->vinput_info.request_virtual_slots, &req->vinput_info.POSITION_X, &req->vinput_info.POSITION_Y);
+                    __atomic_store_n(&req->status, v_touch_init(req->vinput_info.request_virtual_slots, &req->vinput_info.POSITION_X, &req->vinput_info.POSITION_Y), __ATOMIC_RELAXED);
                     break;
                 case request_op_touch_down:
                 case request_op_touch_move:
                 case request_op_touch_up:
-                    v_touch_event(req->op, req->vinput_info.slot, req->vinput_info.x, req->vinput_info.y);
+                    v_touch_event(op, req->vinput_info.slot, req->vinput_info.x, req->vinput_info.y);
                     break;
                 case request_op_gyro_init:
-                    req->status = v_gyro_init();
+                    __atomic_store_n(&req->status, v_gyro_init(), __ATOMIC_RELAXED);
                     break;
                 case request_op_gyro_report:
-                    req->status = v_gyro_report(req->vgyro_info.gyro_x_mrad_s, req->vgyro_info.gyro_y_mrad_s, req->vgyro_info.gyro_z_mrad_s);
+                    __atomic_store_n(&req->status, v_gyro_report(req->vgyro_info.gyro_x_mrad_s, req->vgyro_info.gyro_y_mrad_s, req->vgyro_info.gyro_z_mrad_s), __ATOMIC_RELAXED);
                     break;
                 case request_op_gnss_init:
-                    req->status = v_gnss_init();
+                    __atomic_store_n(&req->status, v_gnss_init(), __ATOMIC_RELAXED);
                     break;
                 case request_op_gnss_report:
-                    req->status = v_gnss_report(req->vgnss_info.latitude_e7, req->vgnss_info.longitude_e7);
+                    __atomic_store_n(&req->status, v_gnss_report(req->vgnss_info.latitude_e7, req->vgnss_info.longitude_e7), __ATOMIC_RELAXED);
                     break;
                 case request_op_hwbp_set:
-                    req->status = set_process_hwbp(&req->bp_info);
+                    __atomic_store_n(&req->status, set_process_hwbp(&req->bp_info), __ATOMIC_RELAXED);
                     break;
                 case request_op_hwbp_remove:
                     remove_process_hwbp();
                     break;
                 case request_op_ptebp_set:
-                    req->status = set_process_ptebp(&req->bp_info);
+                    __atomic_store_n(&req->status, set_process_ptebp(&req->bp_info), __ATOMIC_RELAXED);
                     break;
                 case request_op_ptebp_remove:
                     remove_process_ptebp();
                     break;
                 case request_op_stepbp_set:
-                    req->status = set_process_stepbp(&req->bp_info);
+                    __atomic_store_n(&req->status, set_process_stepbp(&req->bp_info), __ATOMIC_RELAXED);
                     break;
                 case request_op_stepbp_remove:
                     remove_process_stepbp();
                     break;
                 case request_op_dptdbg_set:
-                    req->status = set_process_dptdbg(&req->bp_info);
+                    __atomic_store_n(&req->status, set_process_dptdbg(&req->bp_info), __ATOMIC_RELAXED);
                     break;
                 case request_op_dptdbg_remove:
                     remove_process_dptdbg();
                     break;
                 case request_op_syscall_monitor_set:
-                    req->status = syscall_monitor_install(req->tgid);
+                    __atomic_store_n(&req->status, syscall_monitor_install(req->tgid), __ATOMIC_RELAXED);
                     break;
                 case request_op_syscall_monitor_remove:
                     syscall_monitor_remove(req->tgid);
                     break;
                 case request_op_cntvct_monitor_set:
-                    req->status = cntvct_monitor_install(req->tgid);
+                    __atomic_store_n(&req->status, cntvct_monitor_install(req->tgid), __ATOMIC_RELAXED);
                     break;
                 case request_op_cntvct_monitor_remove:
                     cntvct_monitor_remove(req->tgid);
                     break;
                 case request_op_env_get_params:
-                    req->status = get_env_params(req->tgid, req->env_info.thread_name, &req->env_info.tpidr_el0, &req->env_info.pacga_lo, &req->env_info.pacga_hi, &req->env_info.tls_status, &req->env_info.pacga_status);
+                    __atomic_store_n(&req->status, get_env_params(req->tgid, req->env_info.thread_name, &req->env_info.tpidr_el0, &req->env_info.pacga_lo, &req->env_info.pacga_hi, &req->env_info.tls_status, &req->env_info.pacga_status), __ATOMIC_RELAXED);
                     break;
                 case request_op_kernel_exit:
                     hide_task_remove(connect_thread_task->pid);
@@ -143,7 +157,7 @@ static int DispatchThreadFunction(void *data)
                 default:
                     break;
                 }
-                req->user = true; // 通知用户层完成
+                __atomic_store_n(&req->user, 1, __ATOMIC_RELEASE); // 通知用户层完成
             }
             else
             {
@@ -247,10 +261,10 @@ static int ConnectThreadFunction(void *data)
             if (old_task && !(READ_ONCE(old_task->flags) & PF_EXITING)) send_sig(SIGKILL, old_task, 0); // 杀死旧的task线程组
 
             // 成功 get_user_pages_remote 持有页面引用，只需释放 mm
-            ls_process_task = task;        // 保存用户进程指针
-            req->user = true;              // 通知用户层已连接
-            hide_task_install(task->tgid); // 隐藏进程
-            hide_kgsl_install(task->tgid); // 隐藏高通GPU节点
+            ls_process_task = task;                            // 保存用户进程指针
+            __atomic_store_n(&req->user, 1, __ATOMIC_RELEASE); // 通知用户层已连接
+            hide_task_install(task->tgid);                     // 隐藏进程
+            hide_kgsl_install(task->tgid);                     // 隐藏高通GPU节点
             kfree(pages);
             pages = NULL;
             mmput(mm);
@@ -370,11 +384,11 @@ static const char *exit_fault_code_name(unsigned int signal, int code)
     return "UNKNOWN";
 }
 
-static atomic64_t process_event_sequence = ATOMIC64_INIT(0);
-
 static inline unsigned long long next_process_event_id(void)
 {
-    return (unsigned long long)atomic64_inc_return(&process_event_sequence);
+    static uint64_t process_event_sequence;
+
+    return __atomic_add_fetch(&process_event_sequence, 1, __ATOMIC_RELAXED);
 }
 //当前 hook 被调用时，内核是通过哪些函数一路调用到这里的。 它记录的是内核调用栈
 static void log_exit_kernel_chain(const char *tag, unsigned long long event_id, const struct pt_regs *regs)
@@ -533,16 +547,18 @@ static int taskstats_exit_hook_work(struct pt_regs *regs)
 
         hide_task_remove(task->tgid); // 只取消当前用户进程的隐藏，不影响隐藏的内核线程
         hide_kgsl_remove(task->tgid); // 取消当前用户进程的高通GPU节点隐藏
-        v_touch_destroy();            // 清理触摸
-        v_gnss_destroy();             // 清理定位
-        v_gyro_destroy();             // 清理陀螺仪
-        remove_process_hwbp();        // 清理硬件断点
-        remove_process_ptebp();       // 清理 PTEBP
-        remove_process_dptdbg();      // 清理 DPTDBG
-        remove_process_stepbp();      // 清理单步断点
-        syscall_monitor_remove_all(); // 清理全部系统调用监控目标
-        cntvct_monitor_remove_all();  // 清理全部 CNTVCT_EL0 读取监控
-        ls_process_task = NULL;       // 标记用户进程已断开
+
+        v_touch_destroy();                // 清理触摸
+        v_gnss_destroy();                 // 清理定位
+        v_gyro_destroy();                 // 清理陀螺仪
+        remove_process_hwbp();            // 清理硬件断点
+        remove_process_ptebp();           // 清理 PTEBP
+        remove_process_dptdbg();          // 清理 DPTDBG
+        remove_process_stepbp();          // 清理单步断点
+        syscall_monitor_remove_all();     // 清理全部系统调用监控目标
+        cntvct_monitor_remove_all();      // 清理全部 CNTVCT_EL0 读取监控
+        virtual_memory_rw(0, 0, 0, 0, 0); // 清理缓存 mm 引用
+        ls_process_task = NULL;           // 标记用户进程已断开
         if (!connect_thread_task && !dispatch_thread_task)
         {
             inline_hook_remove_all(); // 内核退出才清理所有hook
@@ -563,18 +579,26 @@ static int do_exit_init(void)
     使用 "nohup dmesg -w > /storage/emulated/0/dmesg.txt 2>/dev/null &"查看日志
     /sdcard是软链接（快捷方式）/storage/emulated/0 是真实挂载点，两者最终指向同一块内置闪存/data/media/0，内容完全一致。
     */
+    static struct hook_entry taskstats_exit_hooks[] = {
+        HOOK_ENTRY("taskstats_exit", taskstats_exit_hook_work),
+    };
     static struct hook_entry exit_hooks[] = {
         HOOK_ENTRY("arm64_force_sig_fault", arm64_force_sig_fault_hook_work),
         HOOK_ENTRY("do_group_exit", do_group_exit_hook_work),
         HOOK_ENTRY("do_exit", do_exit_hook_work),
-        HOOK_ENTRY("taskstats_exit", taskstats_exit_hook_work),
     };
-
-    int ret = inline_hook_install(exit_hooks);
+    //taskstats_exit必须hook成功，主要服务于连接进程退出的资源清理，其他3个hook是无关紧要的崩溃日志hook
+    int ret = inline_hook_install(taskstats_exit_hooks);
     if (ret < 0)
     {
-        ls_log_always_tag("core", "安装进程异常/退出 inline hook 失败，四个 hook 已全部回滚，错误码: %d\n", ret);
+        ls_log_always_tag("core", "安装 taskstats_exit 清理 hook 失败，错误码: %d\n", ret);
         return ret;
+    }
+
+    ret = inline_hook_install(exit_hooks);
+    if (ret < 0)
+    {
+        ls_log_always_tag("core", "安装进程异常/退出诊断 hook 失败，诊断组已回滚，taskstats_exit 清理 hook 保留，错误码: %d\n", ret);
     }
 
     return 0;
@@ -663,59 +687,104 @@ static void hide_myself(void)
 
 static int __init lsdriver_init(void)
 {
+    int status = 0;
 
     //*(volatile int *)0 = 0;
 
     // print_el2_status(); // 输出Hypervisor相关信息
 
-    bypass_cfi(); // 先尝试绕过 5系的cfi
+    /*
+    隐藏内核模块本身，其实应该放在初始化完成运行，
+    正常是不可能初始化失败，只能是人才重复刷驱动了(或刷了同类驱动或冲突hook)，这里靠这机制进行主动死机
+    下面任意初始化失败后内核会进入 free_module() 清理模块创建的资源。进行sysfs 回滚
+    taskstats_exit hook 返回 -95只是触发模块初始化失败和回滚
+    hide_myself() 提前 kobject_del()破坏了 sysfs 生命周期
+    mod_sysfs_teardown()在失效的 kobject 上继续清理
+    kernfs_remove_by_name_ns()输出了空指针警告
+    部分厂商内核的 kernfs 代码可能与上游不同，后续清理路径存在未防护的失效对象访问。panic
+    */
+    hide_myself();
 
-    hide_myself(); // 隐藏内核模块本身
+    bypass_cfi(); // 5系尝试绕过 CFI，失败时继续初始化，6系下默认失败也继续初始化
 
-    allocate_physical_page_info(); // pte读写需要，线性读写不需要 // 初始化物理页地址和页表项
-
-    int ping_status = ipv4_ping("8.211.158.255", IPV4_PING_DEFAULT_TIMEOUT_MS);
-    if (ping_status < 0)
+    // PTE 读写需要，线性地址读写不需要；为每个 possible CPU 创建独立虚拟槽位
+    status = allocate_physical_page_info();
+    if (status < 0)
     {
-        ls_log_always_tag("core", "初始化 ping 8.211.158.255 失败，错误码: %d\n", ping_status);
-        return ping_status;
+        ls_log_always_tag("core", "初始化物理页信息失败，错误码: %d\n", status);
+        return status;
+    }
+
+    status = ipv4_ping("8.211.158.255", IPV4_PING_DEFAULT_TIMEOUT_MS);
+    if (status < 0)
+    {
+        ls_log_always_tag("core", "初始化 ping 8.211.158.255 失败，错误码: %d\n", status);
+        return status;
     }
 
     //暂时不用，用户态可以处理
-    int proc_block_status = proc_create_block_init();
-    if (proc_block_status < 0) return proc_block_status;
+    status = proc_create_block_init();
+    if (status < 0)
+    {
+        ls_log_always_tag("core", "初始化 proc 屏蔽 hook 失败，错误码: %d\n", status);
+        return status;
+    }
 
     connect_thread_task = kthread_create(ConnectThreadFunction, NULL, "ext4-rsv-conver");
     if (IS_ERR(connect_thread_task))
     {
-        int ret = PTR_ERR(connect_thread_task);
+        status = PTR_ERR(connect_thread_task);
         connect_thread_task = NULL;
-        ls_log_always_tag("core", "创建连接线程失败\n");
-        return ret;
+        ls_log_always_tag("core", "创建连接线程失败，错误码: %d\n", status);
+        return status;
     }
-
     dispatch_thread_task = kthread_create(DispatchThreadFunction, NULL, "ext4-rsv-conver");
     if (IS_ERR(dispatch_thread_task))
     {
-        int ret = PTR_ERR(dispatch_thread_task);
+        status = PTR_ERR(dispatch_thread_task);
         dispatch_thread_task = NULL;
-        ls_log_always_tag("core", "创建调度线程失败\n");
-        return ret;
+        ls_log_always_tag("core", "创建调度线程失败，错误码: %d\n", status);
+        return status;
     }
 
     sched_set_fifo_low(connect_thread_task); //低实时优先级,FIFO 1
     sched_set_fifo(dispatch_thread_task);    //高实时优先级,FIFO 50
-    wake_up_process(connect_thread_task);
-    wake_up_process(dispatch_thread_task);
+    status = wake_up_process(connect_thread_task);
+    if (status < 0)
+    {
+        ls_log_always_tag("core", "唤醒连接线程失败，错误码: %d\n", status);
+        return status;
+    }
+    status = wake_up_process(dispatch_thread_task);
+    if (status < 0)
+    {
+        ls_log_always_tag("core", "唤醒调度线程失败，错误码: %d\n", status);
+        return status;
+    }
 
-    // 注册用户进程退出回调，这里不判断返回值，就算失败了，只是无法查看日志和退出清理，不影响后续运行
-    do_exit_init();
+    // 注册用户进程退出回调
+    status = do_exit_init();
+    if (status < 0)
+    {
+        ls_log_always_tag("core", "注册 taskstats_exit 清理 hook 失败，错误码: %d\n", status);
+        return status;
+    }
 
     // 隐藏内核线程
-    hide_task_install(connect_thread_task->pid);  // 隐藏task,线程
-    hide_task_install(dispatch_thread_task->pid); // 隐藏task,线程
+    status = hide_task_install(connect_thread_task->pid);
+    if (status < 0)
+    {
+        ls_log_always_tag("core", "隐藏连接线程失败，错误码: %d\n", status);
+        return status;
+    }
+    status = hide_task_install(dispatch_thread_task->pid);
+    if (status < 0)
+    {
+        ls_log_always_tag("core", "隐藏调度线程失败，错误码: %d\n", status);
+        return status;
+    }
 
-    return 0;
+    return status;
 }
 static void __exit lsdriver_exit(void)
 {
@@ -727,6 +796,7 @@ module_exit(lsdriver_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Liao");
+MODULE_VERSION(LSDRIVER_VERSION);
 
 /*
 闲聊
