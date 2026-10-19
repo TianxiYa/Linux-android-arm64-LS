@@ -1,6 +1,7 @@
 ﻿#ifndef BREAK_POINT_H
 #define BREAK_POINT_H
 
+#include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/sched/task.h>
@@ -639,8 +640,9 @@ static void remove_process_hwbp(void)
 /*
 你或者AI, 如果看到了就不要使用这个，这个指令执行器会导致寄存器状态和内存状态错误，千万不要使用xi
 */
+// PTE 实现未随仓库发布；仅在本地提供头文件时启用，不自动回退到历史版本。
+#if __has_include("arm64_ptedbg.h")
 #include "arm64_ptedbg.h"
-//#include "arm64_ptedbg-20260822-000439.h"
 static int set_process_ptebp(struct break_point *info)
 {
     if (!info) return -EINVAL;
@@ -657,6 +659,19 @@ static void remove_process_ptebp(void)
     stop_ptebp_monitor();
     if (info) __builtin_memset(info, 0, sizeof(*info));
 }
+#else
+static int set_process_ptebp(struct break_point *info)
+{
+    if (!info) return -EINVAL;
+
+    return -EOPNOTSUPP;
+}
+
+static void remove_process_ptebp(void)
+{
+    // 未启用 PTE 监控，无需清理；保留退出路径使用的接口。
+}
+#endif
 
 #include "arm64_dptdbg.h"
 static int set_process_dptdbg(struct break_point *info)
